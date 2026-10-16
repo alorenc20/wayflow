@@ -33,7 +33,7 @@ from wayflowcore._utils.lazy_loader import LazyLoader
 from wayflowcore.idgeneration import IdGenerator
 from wayflowcore.messagelist import ImageContent, TextContent, TextTokenLogProb, TextTokenTopLogProb
 from wayflowcore.models.openaiapitype import OpenAIAPIType
-from wayflowcore.property import _strip_wayflow_json_schema_extensions
+from wayflowcore.property import ListProperty, ObjectProperty, _strip_wayflow_json_schema_extensions
 from wayflowcore.retrypolicy import RetryPolicy
 from wayflowcore.serialization.serializer import serialize_to_dict
 from wayflowcore.tokenusage import TokenUsage
@@ -101,6 +101,7 @@ class ModelProvider(str, Enum):
     """
 
     META = "META"
+    OPENAI = "OPENAI"
     XAI = "XAI"
     COHERE = "COHERE"
     GOOGLE = "GOOGLE"
@@ -123,6 +124,8 @@ def _detect_provider_from_model_id(model_id: str) -> ModelProvider:
         return ModelProvider.GOOGLE
     elif "xai" in provider_name.lower():
         return ModelProvider.XAI
+    elif "openai" in provider_name.lower():
+        return ModelProvider.OPENAI
     else:
         return ModelProvider.OTHER
 
@@ -440,6 +443,7 @@ class OCIGenAIModel(LlmModel):
         logger.debug(f"Raw remote oci genai response: {response.data}")
 
         response_message = provider.convert_completion_into_message(response)
+        response_message = provider.unwrap_response_message(response_message, prompt)
         response_message = prompt.parse_output(response_message)
         return LlmCompletion(message=response_message, token_usage=provider.extract_usage(response))
 
@@ -584,12 +588,31 @@ class OCIGenAIModel(LlmModel):
         provider = _MODEL_PROVIDER_TO_FORMATTER.get(self.provider, _GenericOciApiFormatter)
 
         response = await run_sync_in_thread(self._post_stream_with_retry, provider, prompt)
-        async for chunk in sync_to_async_iterator(
+        chunks = sync_to_async_iterator(
             provider.convert_oci_chunk_iterator_into_tagged_chunk_iterator(
-                iterator=response.data.events(), post_processing=prompt.parse_output
+                iterator=response.data.events(),
             )
-        ):
-            yield chunk
+        )
+        if provider is _OpenAIOciApiFormatter and isinstance(prompt.response_format, ListProperty):
+            # The wire format is an object. Emit the requested list only after the
+            # complete JSON document has arrived, including its closing delimiter.
+            async for chunk_type, message, usage in chunks:
+                if chunk_type == StreamChunkType.TEXT_CHUNK:
+                    continue
+                if chunk_type == StreamChunkType.END_CHUNK:
+                    message = prompt.parse_output(provider.unwrap_response_message(message, prompt))
+                    if not message.tool_requests:
+                        from wayflowcore.messagelist import Message
+
+                        yield StreamChunkType.TEXT_CHUNK, Message(
+                            content=message.content, role="assistant"
+                        ), None
+                yield chunk_type, message, usage
+        else:
+            async for chunk_type, message, usage in chunks:
+                if chunk_type == StreamChunkType.END_CHUNK:
+                    message = prompt.parse_output(message)
+                yield chunk_type, message, usage
 
     async def _stream_generate_impl_openai_sdk(
         self,
@@ -702,6 +725,10 @@ class OCIGenAIModel(LlmModel):
 
 
 class _OciApiFormatter(ABC):
+    @staticmethod
+    def unwrap_response_message(message: "Message", prompt: "Prompt") -> "Message":
+        return message
+
     @classmethod
     @abstractmethod
     def convert_prompt_into_request(cls, prompt: "Prompt", model_id: str) -> Any: ...
@@ -780,6 +807,10 @@ class _OciApiFormatter(ABC):
 class _GenericOciApiFormatter(_OciApiFormatter):
 
     @staticmethod
+    def response_format_property(prompt: "Prompt") -> Any:
+        return prompt.response_format
+
+    @staticmethod
     def _convert_oci_logprobs_into_text_logprobs(logprobs: Any) -> List[TextTokenLogProb]:
         converted: List[TextTokenLogProb] = []
         if not logprobs:
@@ -804,13 +835,14 @@ class _GenericOciApiFormatter(_OciApiFormatter):
     @classmethod
     def convert_prompt_into_request(cls, prompt: "Prompt", model_id: str) -> Any:
         response_format = None
-        if prompt.response_format is not None:
+        response_property = cls.response_format_property(prompt)
+        if response_property is not None:
             json_schema = _strip_wayflow_json_schema_extensions(
-                prompt.response_format.to_json_schema(openai_compatible=True)
+                response_property.to_json_schema(openai_compatible=True)
             )
             response_format = oci.generative_ai_inference.models.JsonSchemaResponseFormat(
                 json_schema=oci.generative_ai_inference.models.ResponseJsonSchema(
-                    name=prompt.response_format.name, is_strict=True, schema=json_schema
+                    name=response_property.name, is_strict=True, schema=json_schema
                 )
             )
 
@@ -977,6 +1009,34 @@ class _MetaOciApiFormatter(_GenericOciApiFormatter):
         generation_config: Optional[LlmGenerationConfig],
     ) -> Any:
         return _generation_config_to_generic_oci_parameters(generation_config, True)
+
+
+class _OpenAIOciApiFormatter(_GenericOciApiFormatter):
+    _LIST_KEY = "items"
+
+    @staticmethod
+    def response_format_property(prompt: "Prompt") -> Any:
+        if not isinstance(prompt.response_format, ListProperty):
+            return prompt.response_format
+        return ObjectProperty(
+            name=prompt.response_format.name,
+            properties={_OpenAIOciApiFormatter._LIST_KEY: prompt.response_format},
+            additional_properties=False,
+        )
+
+    @staticmethod
+    def unwrap_response_message(message: "Message", prompt: "Prompt") -> "Message":
+        if not isinstance(prompt.response_format, ListProperty) or message.tool_requests:
+            return message
+        try:
+            wrapped = json.loads(message.content)
+        except json.JSONDecodeError:
+            return message
+        if isinstance(wrapped, dict) and isinstance(
+            wrapped.get(_OpenAIOciApiFormatter._LIST_KEY), list
+        ):
+            return message.copy(content=json.dumps(wrapped[_OpenAIOciApiFormatter._LIST_KEY]))
+        return message
 
 
 def _generation_config_to_generic_oci_parameters(
@@ -1384,6 +1444,7 @@ def _generation_config_to_cohere_oci_parameters(
 
 _MODEL_PROVIDER_TO_FORMATTER = {
     ModelProvider.META: _MetaOciApiFormatter,
+    ModelProvider.OPENAI: _OpenAIOciApiFormatter,
     ModelProvider.COHERE: _CohereOciApiFormatter,
 }
 

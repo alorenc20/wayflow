@@ -13,6 +13,11 @@ Improvements
 Bug fixes
 ^^^^^^^^^
 
+* **OCI OpenAI root list output**
+
+  Native OCI chat requests for OpenAI models now wrap top-level ``ListProperty`` schemas
+  in an object and return the requested list from complete and streamed responses.
+
 WayFlow 26.3.1
 --------------
 

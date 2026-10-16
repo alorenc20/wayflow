@@ -4,6 +4,8 @@
 # (LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0) or Universal Permissive License
 # (UPL) 1.0 (LICENSE-UPL or https://oss.oracle.com/licenses/upl), at your option.
 
+import asyncio
+import json
 import logging
 import os
 import re
@@ -22,7 +24,11 @@ from wayflowcore.models.ocigenaimodel import (
     OciAPIType,
     ServingMode,
     _GenericOciApiFormatter,
+    _OpenAIOciApiFormatter,
+    _detect_provider_from_model_id,
 )
+from wayflowcore.models._requesthelpers import StreamChunkType
+from wayflowcore.property import ListProperty, ObjectProperty, StringProperty
 from wayflowcore.retrypolicy import RetryPolicy
 from wayflowcore.templates import PromptTemplate
 from wayflowcore.tools import ClientTool
@@ -490,6 +496,73 @@ def test_oci_generic_stream_ignores_done_sentinel():
     )
 
     assert chunks[-1][1].content == "Hi"
+
+
+def test_oci_openai_root_list_schema_and_response():
+    assert _detect_provider_from_model_id("openai.gpt-5.6-sol") == ModelProvider.OPENAI
+    list_format = ListProperty(name="results", item_type=StringProperty())
+    prompt = Prompt(
+        messages=[Message(content="List items", role="user")], response_format=list_format
+    )
+    request = _OpenAIOciApiFormatter.convert_prompt_into_request(prompt, "openai.gpt-5.6-sol")
+    schema = request.response_format.json_schema.schema
+
+    assert schema["type"] == "object"
+    assert schema["required"] == ["items"]
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["items"]["type"] == "array"
+    assert list_format.to_json_schema()["type"] == "array"
+    unwrapped = _OpenAIOciApiFormatter.unwrap_response_message(
+        Message(content='{"items": ["one", "two"]}', role="assistant"), prompt
+    )
+    assert json.loads(prompt.parse_output(unwrapped).content) == ["one", "two"]
+
+
+def test_oci_openai_object_and_other_provider_schemas_unchanged():
+    prompt = Prompt(
+        messages=[Message(content="Return an object", role="user")],
+        response_format=ObjectProperty(
+            name="result", properties={"value": StringProperty()}, additional_properties=False
+        ),
+    )
+    openai_request = _OpenAIOciApiFormatter.convert_prompt_into_request(prompt, "openai.gpt")
+    assert list(openai_request.response_format.json_schema.schema["properties"]) == ["value"]
+
+    list_prompt = prompt.copy(response_format=ListProperty(name="results"))
+    other_request = _GenericOciApiFormatter.convert_prompt_into_request(list_prompt, "xai.grok")
+    assert other_request.response_format.json_schema.schema["type"] == "array"
+
+
+def test_oci_openai_stream_unwraps_root_list(monkeypatch):
+    prompt = Prompt(
+        messages=[Message(content="List items", role="user")],
+        response_format=ListProperty(name="results"),
+    )
+    model = object.__new__(OCIGenAIModel)
+    model.provider = ModelProvider.OPENAI
+    model._client = object()
+    model._oci_serving_mode = object()
+    monkeypatch.setattr(model, "_init_client_if_needed", lambda: None)
+    events = [
+        SimpleNamespace(
+            data='{"message": {"content": [{"type": "TEXT", "text": "{\\"items\\": ["}]}}'
+        ),
+        SimpleNamespace(data='{"message": {"content": [{"type": "TEXT", "text": "\\"one\\"]}"}]}}'),
+    ]
+    response = SimpleNamespace(data=SimpleNamespace(events=lambda: iter(events)))
+    monkeypatch.setattr(model, "_post_stream_with_retry", lambda provider, prompt: response)
+
+    async def collect():
+        return [chunk async for chunk in model._stream_generate_impl_oci_sdk(prompt)]
+
+    chunks = asyncio.run(collect())
+    assert [chunk[0] for chunk in chunks] == [
+        StreamChunkType.START_CHUNK,
+        StreamChunkType.TEXT_CHUNK,
+        StreamChunkType.END_CHUNK,
+    ]
+    assert json.loads(chunks[1][1].content) == ["one"]
+    assert json.loads(chunks[2][1].content) == ["one"]
 
 
 def test_oci_openai_responses_generation_config_reaches_service(oci_reasoning_model):
